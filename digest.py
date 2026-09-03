@@ -21,7 +21,11 @@ STATE.parent.mkdir(parents=True, exist_ok=True)
 CTX = ssl.create_default_context()
 UA = {"User-Agent": "Mozilla/5.0 (market-signals)"}
 
-def http_get(url, timeout=30, tries=3):
+class Transient(Exception):
+    """Временный сбой: лимит запросов, таймаут, сеть. Тревогу не поднимаем."""
+
+def http_get(url, timeout=30, tries=4):
+    import time
     last = None
     for i in range(tries):
         try:
@@ -29,8 +33,9 @@ def http_get(url, timeout=30, tries=3):
                 return r.read()
         except Exception as e:
             last = e
+            code = getattr(e, "code", None)
             if i < tries - 1:
-                import time; time.sleep(5 * (i + 1))
+                time.sleep((20 if code == 429 else 5) * (i + 1))
     raise last
 
 def http_post(url, data, timeout=30):
@@ -48,10 +53,16 @@ def yahoo(symbol):
     return price, chg, (price / peak - 1) * 100
 
 def get_crypto():
-    d = json.loads(http_get("https://api.coingecko.com/api/v3/simple/price"
-                            "?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true"))
-    return (float(d["bitcoin"]["usd"]), float(d["bitcoin"]["usd_24h_change"]),
-            float(d["ethereum"]["usd"]), float(d["ethereum"]["usd_24h_change"]))
+    """CoinGecko основной; при лимите 429 — Yahoo, тем же путём, что Nasdaq."""
+    try:
+        d = json.loads(http_get("https://api.coingecko.com/api/v3/simple/price"
+                                "?ids=bitcoin,ethereum&vs_currencies=usd&include_24hr_change=true"))
+        return (float(d["bitcoin"]["usd"]), float(d["bitcoin"]["usd_24h_change"]),
+                float(d["ethereum"]["usd"]), float(d["ethereum"]["usd_24h_change"]))
+    except Exception:
+        b, bc, _ = yahoo("BTC-USD")
+        e, ec, _ = yahoo("ETH-USD")
+        return b, bc, e, ec
 
 def cbr_usd(day=None):
     url = "https://www.cbr.ru/scripts/XML_daily.asp" + (f"?date_req={day}" if day else "")
@@ -91,7 +102,20 @@ def send(text):
     if not resp.get("ok"):
         raise RuntimeError("telegram: %s" % resp)
 
+def already_sent_today():
+    """Railway может перезапустить контейнер. Второй раз за день не шлём."""
+    if os.environ.get("FORCE"):
+        return False
+    try:
+        ts = json.loads(STATE.read_text()).get("ts", "")
+        return ts[:10] == datetime.now().strftime("%Y-%m-%d")
+    except Exception:
+        return False
+
 def main():
+    if already_sent_today():
+        print("сводка за сегодня уже отправлена — пропускаем")
+        return
     btc, btc_d, eth, eth_d = get_crypto()
     usd, usd_d = get_usdrub()
     jpy, jpy_d = get_usdjpy()
@@ -176,9 +200,14 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        try:
-            send("⚠️ Локальный скрипт сводки упал: %s" % e)
-        except Exception:
-            pass
-        print("FAIL:", e, file=sys.stderr)
-        sys.exit(1)
+        transient = isinstance(e, (Transient, TimeoutError)) or \
+                    getattr(e, "code", None) in (429, 500, 502, 503, 504) or \
+                    isinstance(e, (urllib.error.URLError, OSError))
+        if not transient:
+            try:
+                send("⚠️ Сводка не собралась: %s" % e)
+            except Exception:
+                pass
+        print("FAIL%s: %s" % (" (временный)" if transient else "", e), file=sys.stderr)
+        # выходим нулём: ненулевой код заставляет Railway перезапускать контейнер по кругу
+        sys.exit(0)
