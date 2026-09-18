@@ -136,6 +136,17 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    # Разовый прогон: собрать ленту в файл и выйти. Так его запускает GitHub Actions —
+    # сервер и токен при этом не нужны.
+    if "--once" in sys.argv:
+        out = sys.argv[sys.argv.index("--once") + 1] if len(sys.argv) > sys.argv.index("--once") + 1 else "feed.txt"
+        from datetime import datetime, timezone
+        body = "Собрано: %s\n%s" % (datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), render())
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(body)
+        print("записано %s, байт %d" % (out, len(body.encode())))
+        sys.exit(0)
+
     if not TOKEN:
         print("FAIL: не задана переменная FEED_TOKEN", file=sys.stderr)
         sys.exit(1)
