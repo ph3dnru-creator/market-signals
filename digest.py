@@ -154,4 +154,6 @@ if __name__ == "__main__":
                 save_state(state)
         except Exception as alert_error:
             print("FAIL alert: %s" % alert_error, file=sys.stderr)
-        sys.exit(1)
+        # Railway в прошлом перезапускал контейнер после кода 1 и слал
+        # повторные тревоги. Ошибка видна в логе, уведомление уже отправлено.
+        sys.exit(0)
