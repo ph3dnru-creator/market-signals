@@ -96,8 +96,13 @@ def send(message):
     url = "https://api.telegram.org/bot%s/sendMessage" % TOKEN
     body = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": message}).encode()
     request = urllib.request.Request(url, data=body, headers=UA)
-    with urllib.request.urlopen(request, timeout=30, context=CTX) as response:
-        data = json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=30, context=CTX) as response:
+            data = json.load(response)
+    except (urllib.error.URLError, TimeoutError) as error:
+        # HTTPError содержит полный URL с токеном бота; не выводим его в логи.
+        code = getattr(error, "code", "network")
+        raise RuntimeError("Telegram send failed (%s)" % code) from None
     if not data.get("ok"):
         raise RuntimeError("Telegram rejected message")
 
