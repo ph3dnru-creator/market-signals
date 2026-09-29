@@ -22,6 +22,7 @@ STATE = Path(os.environ.get("STATE_PATH", str(Path(__file__).parent / "state.jso
 CTX = ssl.create_default_context()
 UA = {"User-Agent": "Mozilla/5.0 (market-signals)"}
 MSK = ZoneInfo("Europe/Moscow")
+VIDEO_REPORTS = Path(__file__).parent / "video_reports.jsonl"
 
 
 def http_get(url, tries=3):
@@ -124,8 +125,33 @@ def save_state(state):
     os.replace(temp, STATE)
 
 
+def send_video_reports(state):
+    """Deliver each reviewed video once, retaining progress across cron runs."""
+    if not VIDEO_REPORTS.exists():
+        return 0
+    sent = set(state.get("video_report_ids", []))
+    count = 0
+    for line in VIDEO_REPORTS.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        report = json.loads(line)
+        video_id = report["id"]
+        if video_id in sent:
+            continue
+        message = report["message"]
+        if not isinstance(message, str) or len(message) > 4000:
+            raise ValueError("Invalid video report message for %s" % video_id)
+        send(message)
+        sent.add(video_id)
+        state["video_report_ids"] = sorted(sent)
+        save_state(state)
+        count += 1
+    return count
+
+
 def main():
     state = load_state()
+    video_reports_sent = send_video_reports(state)
     quotes = fetch_quotes()
     now = datetime.now(MSK)
     statuses, events = evaluate(quotes, state.get("statuses", {}))
@@ -143,7 +169,8 @@ def main():
     state["last_success"] = now.isoformat()
     state["error_alerted"] = False
     save_state(state)
-    print("OK: проверено %s; новых событий %d" % (now.isoformat(), 0 if first_run else len(events)))
+    print("OK: проверено %s; новых событий %d; разборов видео %d" %
+          (now.isoformat(), 0 if first_run else len(events), video_reports_sent))
 
 
 if __name__ == "__main__":
