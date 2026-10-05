@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 
 from signals import evaluate, format_event, format_status
 from video_watch import CHANNELS, recent_videos
+from video_analysis import analyze_video
 
 TOKEN = os.environ.get("TG_TOKEN", "")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "")
@@ -152,30 +153,66 @@ def send_video_reports(state):
 
 
 def check_new_videos(state, now):
-    """Check channel uploads once per Moscow day and notify only on new IDs."""
+    """Discover, recover old link-only notifications, analyze and deliver once daily."""
     today = now.date().isoformat()
     if now.hour < 9 or state.get("last_video_check") == today:
         return 0
-    if "video_seen" not in state:
-        state["video_seen"] = json.loads(VIDEO_BASELINE.read_text(encoding="utf-8"))
-        save_state(state)
-    discovered = 0
+    baseline = json.loads(VIDEO_BASELINE.read_text(encoding="utf-8"))
+    state.setdefault("video_seen", baseline)
+    pending = state.setdefault("video_pending", {})
+    sent = set(state.get("video_report_ids", []))
+    # Old code marked link-only notices as seen. They still need a real report.
+    for handle, ids in state["video_seen"].items():
+        if handle not in CHANNELS:
+            continue
+        for video_id in ids:
+            if video_id not in baseline.get(handle, []) and video_id not in sent:
+                pending.setdefault(video_id, {"id": video_id, "channel": CHANNELS[handle]})
+    discovery_failed = False
     for handle in CHANNELS:
+        try:
+            videos = recent_videos(handle)
+        except Exception:
+            discovery_failed = True
+            print("Video discovery failed for @" + handle, file=sys.stderr)
+            continue
         known = set(state["video_seen"].get(handle, []))
-        videos = recent_videos(handle)
         for video in reversed(videos):
-            video_id = video["id"]
-            if video_id in known:
-                continue
-            send("📺 Капитал: новое видео канала «%s»\n%s\nРазбор ещё не выполнен; пришлите ссылку в чат для проверки фактов и решения по стратегии."
-                 % (video["channel"], video["url"]))
-            state["video_seen"].setdefault(handle, []).append(video_id)
-            save_state(state)
-            known.add(video_id)
-            discovered += 1
+            if video["id"] not in known:
+                pending.setdefault(video["id"], video)
+                state["video_seen"].setdefault(handle, []).append(video["id"])
+                known.add(video["id"])
+    # Attempts, including failures, are daily. Pending items survive until delivered.
     state["last_video_check"] = today
     save_state(state)
-    return discovered
+    count = 0
+    failed = discovery_failed
+    for video_id, video in list(pending.items()):
+        if video_id in sent:
+            del pending[video_id]
+            continue
+        try:
+            message = analyze_video(video, STATE.parent / "video_analysis")
+            send(message)
+        except Exception:
+            failed = True
+            print("Video report pending: " + video_id, file=sys.stderr)
+            continue
+        sent.add(video_id)
+        state["video_report_ids"] = sorted(sent)
+        del pending[video_id]
+        save_state(state)
+        count += 1
+    if failed and not state.get("video_error_alerted"):
+        reason = ("Не настроен GEMINI_API_KEY в Railway." if not os.environ.get("GEMINI_API_KEY")
+                  else "Не удалось получить полный текст, проверить факты или доставить отчёт.")
+        send("⚙️ Капитал: сбой автоматического разбора видео. " + reason +
+             " Видео сохранены в очереди; повтор — при следующей ежедневной проверке.")
+        state["video_error_alerted"] = True
+    elif not failed:
+        state["video_error_alerted"] = False
+    save_state(state)
+    return count
 
 
 def main():

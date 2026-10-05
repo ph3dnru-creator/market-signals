@@ -26,19 +26,34 @@ class VideoReportDeliveryTest(unittest.TestCase):
                     send.assert_called_once_with("second")
                     self.assertEqual(digest.send_video_reports(digest.load_state()), 0)
 
-    def test_checks_channels_once_daily_and_only_notifies_new_videos(self):
+    def test_daily_ready_report_and_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
-            baseline_path = Path(directory) / "baseline.json"
-            baseline_path.write_text(json.dumps({key: ["old"] for key in digest.CHANNELS}), encoding="utf-8")
-            now = datetime(2026, 9, 29, 9, 15, tzinfo=ZoneInfo("Europe/Moscow"))
-            with patch.object(digest, "STATE", state_path), patch.object(digest, "VIDEO_BASELINE", baseline_path), \
-                 patch.object(digest, "recent_videos", return_value=[{"id": "new", "channel": "Тест", "url": "https://example.com"}]) as recent, \
-                 patch.object(digest, "send") as send:
-                self.assertEqual(digest.check_new_videos(digest.load_state(), now), len(digest.CHANNELS))
-                self.assertEqual(send.call_count, len(digest.CHANNELS))
+            baseline = Path(directory) / "baseline.json"
+            baseline.write_text(json.dumps({key: [] for key in digest.CHANNELS}))
+            now = datetime(2026, 10, 5, 9, 15, tzinfo=ZoneInfo("Europe/Moscow"))
+            video = {"id": "Co8EMfLkVoc", "channel": "Тест"}
+            with patch.object(digest, "STATE", state_path), patch.object(digest, "VIDEO_BASELINE", baseline), patch.object(digest, "recent_videos", return_value=[video]), patch.object(digest, "send") as send, patch.object(digest, "analyze_video", side_effect=RuntimeError("API")):
                 self.assertEqual(digest.check_new_videos(digest.load_state(), now), 0)
-                self.assertEqual(recent.call_count, len(digest.CHANNELS))
+                state = digest.load_state()
+                self.assertIn(video['id'], state['video_pending'])
+                self.assertNotIn(video['id'], state.get('video_report_ids', []))
+                self.assertEqual(digest.check_new_videos(state, now), 0)
+            with patch.object(digest, "STATE", state_path), patch.object(digest, "VIDEO_BASELINE", baseline), patch.object(digest, "recent_videos", return_value=[video]), patch.object(digest, "send") as send, patch.object(digest, "analyze_video", return_value="Готовый проверенный отчёт"):
+                self.assertEqual(digest.check_new_videos(digest.load_state(), now.replace(day=6)), 1)
+                send.assert_called_once_with("Готовый проверенный отчёт")
+                self.assertEqual(digest.load_state()['video_pending'], {})
+                self.assertEqual(digest.check_new_videos(digest.load_state(), now.replace(day=7)), 0)
+
+    def test_recovers_previous_link_notification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            baseline = Path(directory) / 'baseline.json'
+            baseline.write_text(json.dumps({key: [] for key in digest.CHANNELS}))
+            state = {'version': 2, 'video_seen': {next(iter(digest.CHANNELS)): ['Co8EMfLkVoc']}}
+            now = datetime(2026, 10, 5, 9, tzinfo=ZoneInfo('Europe/Moscow'))
+            with patch.object(digest, 'STATE', Path(directory) / 'state.json'), patch.object(digest, 'VIDEO_BASELINE', baseline), patch.object(digest, 'recent_videos', return_value=[]), patch.object(digest, 'analyze_video', return_value='Отчёт'), patch.object(digest, 'send') as send:
+                self.assertEqual(digest.check_new_videos(state, now), 1)
+                send.assert_called_once_with('Отчёт')
 
 
 if __name__ == "__main__":

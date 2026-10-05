@@ -11,6 +11,12 @@ BASE = {"btc": 86000, "eth": 2700, "usd": 83, "usd_date": "27/09/2026",
 
 
 class DigestTest(unittest.TestCase):
+    def setUp(self):
+        for name in ('check_new_videos', 'send_video_reports'):
+            mock = patch.object(digest, name, return_value=0)
+            mock.start()
+            self.addCleanup(mock.stop)
+
     def test_first_run_silent_then_one_event(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(digest, "STATE", Path(directory) / "state.json"):
