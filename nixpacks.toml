@@ -1,1 +1,2 @@
-[phases.setup]\naptPkgs = ["ffmpeg"]\n
+[phases.setup]
+aptPkgs = ["ffmpeg"]
