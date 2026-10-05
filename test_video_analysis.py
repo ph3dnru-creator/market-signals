@@ -18,16 +18,16 @@ class AnalysisTest(unittest.TestCase):
     def test_full_pipeline_and_cached_delivery(self):
         with tempfile.TemporaryDirectory() as directory:
             transcript = {'complete': True, 'transcript': 'Полный текст. ' * 100}
-            with patch.object(va, 'generate', side_effect=[(transcript, {}), (REPORT, GROUNDING)]) as generate:
+            with patch('video_transcript.fetch_transcript', return_value=transcript), patch.object(va, 'generate', return_value=(REPORT, GROUNDING)) as generate:
                 message = va.analyze_video(VIDEO, directory)
-                self.assertEqual(generate.call_count, 2)
+                self.assertEqual(generate.call_count, 1)
                 self.assertIn('Влияние на стратегию', message)
             with patch.object(va, 'generate', side_effect=AssertionError('Cache must prevent API calls')):
                 self.assertEqual(va.analyze_video(VIDEO, directory), message)
 
     def test_incomplete_transcript_is_not_saved_as_report(self):
         with tempfile.TemporaryDirectory() as directory:
-            with patch.object(va, 'generate', return_value=({'complete': False, 'transcript': 'x' * 500}, {})):
+            with patch('video_transcript.fetch_transcript', return_value={'complete': False, 'transcript': 'x' * 500}):
                 with self.assertRaises(va.AnalysisError):
                     va.analyze_video(VIDEO, directory)
             self.assertFalse((Path(directory) / (VIDEO['id'] + '.json')).exists())

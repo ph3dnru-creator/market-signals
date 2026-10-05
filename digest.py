@@ -204,7 +204,7 @@ def check_new_videos(state, now):
         save_state(state)
         count += 1
     if failed and not state.get("video_error_alerted"):
-        reason = ("Не настроен GEMINI_API_KEY в Railway." if not os.environ.get("GEMINI_API_KEY")
+        reason = ("Не настроен OPENAI_API_KEY в Railway." if not os.environ.get("OPENAI_API_KEY")
                   else "Не удалось получить полный текст, проверить факты или доставить отчёт.")
         send("⚙️ Капитал: сбой автоматического разбора видео. " + reason +
              " Видео сохранены в очереди; повтор — при следующей ежедневной проверке.")
