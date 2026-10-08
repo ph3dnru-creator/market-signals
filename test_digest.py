@@ -12,6 +12,9 @@ BASE = {"btc": 86000, "eth": 2700, "usd": 83, "usd_date": "27/09/2026",
 
 class DigestTest(unittest.TestCase):
     def setUp(self):
+        formatter = patch.object(digest, 'format_event', return_value='Approved action')
+        formatter.start()
+        self.addCleanup(formatter.stop)
         for name in ('check_new_videos', 'send_video_reports'):
             mock = patch.object(digest, name, return_value=0)
             mock.start()
@@ -32,6 +35,17 @@ class DigestTest(unittest.TestCase):
                     with patch.object(digest, "fetch_quotes", return_value=BASE):
                         digest.main()
                     self.assertEqual(send.call_count, 2)
+
+    def test_observation_without_action_is_silent_and_saved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(digest, "STATE", Path(directory) / "state.json"), patch.object(digest, "send") as send, patch.object(digest, "format_event", return_value=None):
+                with patch.object(digest, "fetch_quotes", return_value=BASE):
+                    digest.main()
+                with patch.object(digest, "fetch_quotes", return_value=dict(BASE, usd=84.2)):
+                    digest.main()
+                    digest.main()
+                send.assert_not_called()
+                self.assertEqual(digest.load_state()["statuses"]["usd_high"], "active")
 
     def test_failed_send_preserves_old_state_for_retry(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -227,7 +227,9 @@ def main():
         send(format_status(quotes, statuses, now))
     if not first_run:
         for event in events:
-            send(format_event(event, now))
+            message = format_event(event, now)
+            if message:
+                send(message)
             # После отправки фиксируем переход по одному: повторный запуск
             # продолжит остальные события, не рассылая уже учтённые.
             state["statuses"][event["key"]] = event["status"]

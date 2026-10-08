@@ -1,6 +1,7 @@
 import unittest
 
-from signals import evaluate
+from signals import evaluate, format_event
+from datetime import datetime
 
 
 BASE = {"btc": 86000, "eth": 2700, "usd": 83, "jpy": 157,
@@ -24,6 +25,19 @@ class SignalsTest(unittest.TestCase):
         next_state, events = evaluate(dict(BASE, ndx=None, ndx_drawdown=None), active)
         self.assertEqual(next_state["ndx"], "active")
         self.assertEqual(events, [])
+
+    def test_ratio_does_not_flap_near_threshold(self):
+        state, _ = evaluate(dict(BASE, eth=BASE["btc"] * .0306), {})
+        for ratio in (.03101, .03099, .0311, .0309):
+            state, events = evaluate(dict(BASE, eth=BASE["btc"] * ratio), state)
+            self.assertFalse(any(e["key"] == "ethbtc" for e in events))
+            self.assertEqual(state["ethbtc"], "inactive")
+        state, events = evaluate(dict(BASE, eth=BASE["btc"] * .0314), state)
+        self.assertEqual(state["ethbtc"], "active")
+        self.assertTrue(any(e["key"] == "ethbtc" for e in events))
+
+    def test_no_approved_action_means_no_message(self):
+        self.assertIsNone(format_event({"key": "ethbtc", "status": "active"}, datetime.now()))
 
     def test_bad_quote_is_not_inactive_signal(self):
         with self.assertRaises(ValueError):
