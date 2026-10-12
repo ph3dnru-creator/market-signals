@@ -47,6 +47,28 @@ class DigestTest(unittest.TestCase):
                 send.assert_not_called()
                 self.assertEqual(digest.load_state()["statuses"]["usd_high"], "active")
 
+    def test_disconnect_is_retried(self):
+        import http.client
+        from unittest.mock import MagicMock
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b"ok"
+        with patch.object(digest.urllib.request, "urlopen", side_effect=[http.client.RemoteDisconnected(), response]) as request, patch.object(digest.time, "sleep"):
+            self.assertEqual(digest.http_get("https://example.org"), b"ok")
+            self.assertEqual(request.call_count, 2)
+
+    def test_only_persistent_failure_alerts_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(digest, "STATE", Path(directory) / "state.json"), patch.object(digest, "TOKEN", "test"), patch.object(digest, "CHAT_ID", "test"), patch.object(digest, "send") as send:
+                digest.record_failure()
+                digest.record_failure()
+                send.assert_not_called()
+                digest.record_failure()
+                digest.record_failure()
+                self.assertEqual(send.call_count, 1)
+                with patch.object(digest, "fetch_quotes", return_value=BASE):
+                    digest.main()
+                self.assertEqual(digest.load_state()["consecutive_failures"], 0)
+
     def test_failed_send_preserves_old_state_for_retry(self):
         with tempfile.TemporaryDirectory() as directory:
             with patch.object(digest, "STATE", Path(directory) / "state.json"):

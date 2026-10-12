@@ -2,6 +2,7 @@
 """Проверяет рынок и отправляет в Telegram только изменения сигналов."""
 
 import json
+import http.client
 import os
 import ssl
 import sys
@@ -35,7 +36,7 @@ def http_get(url, tries=3):
             request = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(request, timeout=30, context=CTX) as response:
                 return response.read()
-        except (urllib.error.URLError, TimeoutError) as error:
+        except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as error:
             last = error
             if attempt < tries - 1:
                 time.sleep(5 * (attempt + 1))
@@ -58,7 +59,7 @@ def get_crypto():
     try:
         data = json.loads(http_get(url))
         return float(data["bitcoin"]["usd"]), float(data["ethereum"]["usd"])
-    except (urllib.error.URLError, TimeoutError, KeyError, ValueError):
+    except (urllib.error.URLError, TimeoutError, http.client.HTTPException, KeyError, ValueError):
         btc, _ = yahoo("BTC-USD")
         eth, _ = yahoo("ETH-USD")
         return btc, eth
@@ -83,12 +84,12 @@ def fetch_quotes():
     usd, usd_date = cbr_usd()
     try:
         jpy, _ = yahoo("JPY=X")
-    except (urllib.error.URLError, TimeoutError, KeyError, ValueError):
+    except (urllib.error.URLError, TimeoutError, http.client.HTTPException, KeyError, ValueError):
         data = json.loads(http_get("https://api.frankfurter.app/latest?from=USD&to=JPY"))
         jpy = float(data["rates"]["JPY"])
     try:
         ndx, drawdown = yahoo("%5EIXIC")
-    except (urllib.error.URLError, TimeoutError, KeyError, ValueError):
+    except (urllib.error.URLError, TimeoutError, http.client.HTTPException, KeyError, ValueError):
         ndx = drawdown = None
     return {"btc": btc, "eth": eth, "usd": usd, "usd_date": usd_date,
             "jpy": jpy, "ndx": ndx, "ndx_drawdown": drawdown}
@@ -103,7 +104,7 @@ def send(message):
     try:
         with urllib.request.urlopen(request, timeout=30, context=CTX) as response:
             data = json.load(response)
-    except (urllib.error.URLError, TimeoutError) as error:
+    except (urllib.error.URLError, TimeoutError, http.client.HTTPException) as error:
         # HTTPError содержит полный URL с токеном бота; не выводим его в логи.
         code = getattr(error, "code", "network")
         raise RuntimeError("Telegram send failed (%s)" % code) from None
@@ -237,24 +238,33 @@ def main():
     state["statuses"] = statuses
     state["last_success"] = now.isoformat()
     state["error_alerted"] = False
+    state["consecutive_failures"] = 0
     save_state(state)
     print("OK: проверено %s; новых событий %d; новых видео %d; разборов видео %d" %
           (now.isoformat(), 0 if first_run else len(events), new_videos, video_reports_sent))
+
+
+def record_failure():
+    state = load_state()
+    state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+    save_state(state)
+    if state["consecutive_failures"] >= 3 and not state.get("error_alerted") and TOKEN and CHAT_ID:
+        send("⚠️ Капитал: проверка рынка временно недоступна\n\n"
+             "Три запуска подряд завершились ошибкой. Последние данные могут быть устаревшими.\n\n"
+             "Действие: не совершать сделки по старым сигналам бота.\n"
+             "Повторная проверка — при следующем запуске; повторных предупреждений во время этого сбоя не будет.")
+        state["error_alerted"] = True
+        save_state(state)
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print("FAIL: %s" % error, file=sys.stderr)
+        # Do not expose URLs, credentials or raw provider error text.
+        print("FAIL: %s" % type(error).__name__, file=sys.stderr)
         try:
-            state = load_state()
-            if not state.get("error_alerted") and TOKEN and CHAT_ID:
-                send("⚠️ Капитал: мониторинг не смог проверить сигналы. Причина: %s" % error)
-                state["error_alerted"] = True
-                save_state(state)
+            record_failure()
         except Exception as alert_error:
-            print("FAIL alert: %s" % alert_error, file=sys.stderr)
-        # Railway в прошлом перезапускал контейнер после кода 1 и слал
-        # повторные тревоги. Ошибка видна в логе, уведомление уже отправлено.
+            print("FAIL alert: %s" % type(alert_error).__name__, file=sys.stderr)
         sys.exit(0)
