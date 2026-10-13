@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from signals import evaluate, format_event, format_status
 from video_watch import CHANNELS, recent_videos
-from video_analysis import analyze_video
+from video_analysis import analyze_video, AnalysisError
 
 TOKEN = os.environ.get("TG_TOKEN", "")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "")
@@ -188,25 +188,37 @@ def check_new_videos(state, now):
     save_state(state)
     count = 0
     failed = discovery_failed
+    failures = {}
     for video_id, video in list(pending.items()):
         if video_id in sent:
             del pending[video_id]
             continue
         try:
             message = analyze_video(video, STATE.parent / "video_analysis")
+        except Exception as error:
+            failed = True
+            code = "youtube_text_unavailable" if isinstance(error, AnalysisError) and str(error) in ("YouTube captions and audio unavailable", "Complete transcript unavailable") else "analysis_failed"
+            failures[video_id] = {"stage": "analysis", "code": code, "date": today}
+            print("Video report pending: %s; stage=analysis; code=%s" % (video_id, code), file=sys.stderr)
+            continue
+        try:
             send(message)
         except Exception:
             failed = True
-            print("Video report pending: " + video_id, file=sys.stderr)
+            failures[video_id] = {"stage": "delivery", "code": "telegram_failed", "date": today}
+            print("Video report pending: %s; stage=delivery; code=telegram_failed" % video_id, file=sys.stderr)
             continue
         sent.add(video_id)
         state["video_report_ids"] = sorted(sent)
         del pending[video_id]
         save_state(state)
         count += 1
+    state["video_failures"] = failures
     if failed and not state.get("video_error_alerted"):
         reason = ("Не настроен OPENAI_API_KEY в Railway." if not os.environ.get("OPENAI_API_KEY")
-                  else "Не удалось получить полный текст, проверить факты или доставить отчёт.")
+                  else "YouTube не предоставил текст или аудио для разбора." if failures and all(f["code"] == "youtube_text_unavailable" for f in failures.values())
+                  else "Готовый отчёт не удалось отправить в Telegram." if failures and all(f["stage"] == "delivery" for f in failures.values())
+                  else "Не удалось завершить разбор или обнаружить новые видео; этапы сбоя записаны в журнал.")
         send("⚙️ Капитал: сбой автоматического разбора видео. " + reason +
              " Видео сохранены в очереди; повтор — при следующей ежедневной проверке.")
         state["video_error_alerted"] = True
