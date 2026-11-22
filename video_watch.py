@@ -1,4 +1,4 @@
-"""Discover recent uploads from the two YouTube channels watched by Capital.
+"""Discover recent uploads from the YouTube channels watched by Capital.
 
 Prints JSON. This module never sends notifications or changes portfolio rules.
 """
@@ -11,6 +11,7 @@ import urllib.request
 CHANNELS = {
     "SvyatoslavKonenkov": "Святослав Коненков",
     "TheRichestDee": "Богатейший Ди",
+    "k-zyry": "Константин Зырянов",
 }
 USER_AGENT = "Mozilla/5.0 (Capital video monitor)"
 
