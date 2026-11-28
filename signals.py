@@ -37,8 +37,8 @@ def load_plan():
 
 def plan_snapshot(plan):
     # Dates, market quotes and source prose alone do not change an action.
-    fields = ("id", "asset", "side", "budget_rub", "first_tranche_rub", "price", "when", "wait_for", "status")
-    return {"rows": [{k: r[k] for k in fields} for r in plan["rows"]],
+    fields = ("id", "asset", "side", "budget_rub", "first_tranche_rub", "price", "when", "wait_for", "status", "min_price", "max_price", "currency", "symbol")
+    return {"rows": [{k: r.get(k) for k in fields} for r in plan["rows"]],
             "broker_ready": plan["broker_ready"], "review_by": plan["review_by"],
             "free_capital_rub": plan["free_capital_rub"], "obligations": plan["obligations"]}
 
@@ -52,12 +52,14 @@ def format_plan_change(plan, previous):
     if previous == current:
         return None
     if previous is None:
+        entries = [f"{row['asset']}: первый транш {rub(row['first_tranche_rub'])}; {row['price']}."
+                   for row in plan['rows'] if row.get('symbol')]
         return ("📋 Капитал · обновлён план\n\n"
                 "Сейчас: новых рискованных покупок 0 ₽.\n"
                 f"Сохраняем ликвидно: {rub(plan['free_capital_rub'])}.\n\n"
-                "Neo: первый транш 100 000 ₽ только при C$18–19.\n"
-                "MP: первый транш 50 000 ₽ только при $22–25.\n"
-                "До подтверждения брокера заявки не ставим. Общий лимит темы 450 000 ₽ включён в 3 млн ₽.\n\n"
+                + '\n'.join(entries) + '\n'
+                + ("Брокер подтверждён; дополнительно проверяем цену и новости. " if plan['broker_ready'] else "До подтверждения брокера заявки не ставим. ")
+                + f"Общий лимит темы {rub(plan['theme_cap_rub'])} включён в свободный бюджет.\n\n"
                 "Старые покупки валюты на 22 млн ₽ и крипты на 10,7 млн ₽ сняты с исполнения.\n"
                 "Новые видео без конкретного изменения плана — без уведомлений.\n\n" + plan["dashboard_url"])
     old = {r["id"]: r for r in previous.get("rows", [])}
