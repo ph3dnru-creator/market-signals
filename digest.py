@@ -15,9 +15,11 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from signals import evaluate, format_event, format_status
+from signals import (evaluate, format_event, format_status, load_plan,
+                     plan_snapshot, format_plan_change, evaluate_plan,
+                     format_plan_entry, rub)
 from video_watch import CHANNELS, recent_videos
-from video_analysis import analyze_video, AnalysisError
+from video_analysis import analyze_video, plan_proposal, AnalysisError
 
 TOKEN = os.environ.get("TG_TOKEN", "")
 CHAT_ID = os.environ.get("TG_CHAT_ID", "")
@@ -153,7 +155,7 @@ def send_video_reports(state):
     return count
 
 
-def check_new_videos(state, now):
+def check_new_videos(state, now, plan=None):
     """Discover, recover old link-only notifications, analyze and deliver once daily."""
     today = now.date().isoformat()
     if now.hour < 9 or state.get("last_video_check") == today:
@@ -162,12 +164,14 @@ def check_new_videos(state, now):
     state.setdefault("video_seen", baseline)
     pending = state.setdefault("video_pending", {})
     sent = set(state.get("video_report_ids", []))
+    reviewed = set(state.get("video_reviewed_ids", [])) if plan else sent
+    completed = sent | reviewed
     # Old code marked link-only notices as seen. They still need a real report.
     for handle, ids in state["video_seen"].items():
         if handle not in CHANNELS:
             continue
         for video_id in ids:
-            if video_id not in baseline.get(handle, []) and video_id not in sent:
+            if video_id not in baseline.get(handle, []) and video_id not in completed:
                 pending.setdefault(video_id, {"id": video_id, "channel": CHANNELS[handle]})
     discovery_failed = False
     for handle in CHANNELS:
@@ -189,18 +193,34 @@ def check_new_videos(state, now):
     count = 0
     failed = discovery_failed
     failures = {}
-    for video_id, video in list(pending.items()):
-        if video_id in sent:
+    items = list(pending.items())
+    if plan:
+        items = list(reversed(items))[:6]
+    for video_id, video in items:
+        if video_id in completed:
             del pending[video_id]
             continue
         try:
             message = analyze_video(video, STATE.parent / "video_analysis")
+            proposal = plan_proposal(video, STATE.parent / "video_analysis", plan) if plan else None
         except Exception as error:
             failed = True
-            code = "youtube_text_unavailable" if isinstance(error, AnalysisError) and str(error) in ("YouTube captions and audio unavailable", "Complete transcript unavailable") else "analysis_failed"
+            code = ("api_credits_exhausted" if isinstance(error, AnalysisError) and str(error) == "OpenAI API credits exhausted" else "youtube_text_unavailable" if isinstance(error, AnalysisError) and str(error) in ("YouTube captions and audio unavailable", "Complete transcript unavailable") else "analysis_failed")
             failures[video_id] = {"stage": "analysis", "code": code, "date": today}
             print("Video report pending: %s; stage=analysis; code=%s" % (video_id, code), file=sys.stderr)
+            if code == "api_credits_exhausted":
+                break
             continue
+        if plan:
+            keys = set(state.get("plan_proposal_keys", []))
+            proposal_key = (plan['version'] + ':' + proposal[0]) if proposal else None
+            if not proposal or proposal_key in keys:
+                reviewed.add(video_id)
+                state["video_reviewed_ids"] = sorted(reviewed)
+                del pending[video_id]
+                save_state(state)
+                continue
+            message = proposal[1]
         try:
             send(message)
         except Exception:
@@ -208,13 +228,19 @@ def check_new_videos(state, now):
             failures[video_id] = {"stage": "delivery", "code": "telegram_failed", "date": today}
             print("Video report pending: %s; stage=delivery; code=telegram_failed" % video_id, file=sys.stderr)
             continue
-        sent.add(video_id)
-        state["video_report_ids"] = sorted(sent)
+        if plan:
+            keys.add(proposal_key)
+            state["plan_proposal_keys"] = sorted(keys)
+            reviewed.add(video_id)
+            state["video_reviewed_ids"] = sorted(reviewed)
+        else:
+            sent.add(video_id)
+            state["video_report_ids"] = sorted(sent)
         del pending[video_id]
         save_state(state)
         count += 1
     state["video_failures"] = failures
-    if failed and not state.get("video_error_alerted"):
+    if failed and not state.get("video_error_alerted") and not plan:
         reason = ("Не настроен OPENAI_API_KEY в Railway." if not os.environ.get("OPENAI_API_KEY")
                   else "YouTube не предоставил текст или аудио для разбора." if failures and all(f["code"] == "youtube_text_unavailable" for f in failures.values())
                   else "Готовый отчёт не удалось отправить в Telegram." if failures and all(f["stage"] == "delivery" for f in failures.values())
@@ -228,8 +254,78 @@ def check_new_videos(state, now):
     return count
 
 
+def fetch_plan_quotes(plan):
+    quotes = {}
+    if not plan["broker_ready"]:
+        return quotes
+    for row in plan["rows"]:
+        if not row.get("symbol"):
+            continue
+        try:
+            symbol = urllib.parse.quote(row["symbol"], safe="")
+            result = json.loads(http_get("https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=5d"))["chart"]["result"][0]
+            meta = result["meta"]
+            quotes[row["id"]] = {"price": float(meta["regularMarketPrice"]),
+                                  "timestamp": float(meta["regularMarketTime"]),
+                                  "currency": meta["currency"]}
+        except Exception as error:
+            print("Plan quote unavailable: %s; %s" % (row["id"], type(error).__name__), file=sys.stderr)
+    return quotes
+
+
+def run_plan(state, plan, now):
+    """One daily run; only persisted action changes can reach Telegram."""
+    if now.hour < 9 or (state.get("last_plan_check") == now.date().isoformat() and state.get("plan_snapshot") == plan_snapshot(plan)):
+        return
+    message = format_plan_change(plan, state.get("plan_snapshot"))
+    if message:
+        send(message)
+        state["plan_snapshot"] = plan_snapshot(plan)
+        save_state(state)
+    keys = set(state.get("plan_notification_keys", []))
+    quotes = fetch_plan_quotes(plan)
+    statuses, entries = evaluate_plan(plan, quotes, state.get("plan_statuses", {}), now)
+    for entry in entries:
+        key = plan["version"] + ':' + entry["id"] + ':entry'
+        if key not in keys:
+            send(format_plan_entry(entry) + '\n\n' + plan["dashboard_url"])
+            keys.add(key)
+            state["plan_notification_keys"] = sorted(keys)
+            save_state(state)
+    for obligation in plan["obligations"]:
+        days = (datetime.fromisoformat(obligation["due"]).date() - now.date()).days
+        key = obligation["id"] + ':prepare'
+        if not obligation["paid"] and 0 <= days <= obligation["remind_days"] and key not in keys:
+            send(f"📋 Капитал · пора подготовить платёж\n\n{obligation['asset']}\n"
+                 f"Действие: обеспечить {rub(obligation['amount_rub'])} в рублях к {obligation['due']}.\n"
+                 "Сумма из резерва жилья, не из свободного инвестиционного бюджета.\n"
+                 f"Последнее подтверждение графика: {obligation['confirmed_as_of']}. Если платёж уже внесён или договор прекращён, сообщи в чат — обновим план.\n\n" + plan["dashboard_url"])
+            keys.add(key)
+            state["plan_notification_keys"] = sorted(keys)
+            save_state(state)
+    if now.date() > datetime.fromisoformat(plan["review_by"]).date() and plan["version"] + ':expired' not in keys:
+        send("📋 Капитал · срок условий покупки истёк\n\n"
+             "Действие: не ставить новые заявки Neo/MP по прежним ценам. Сначала обновить оценку и бюджет.\n\n" + plan["dashboard_url"])
+        keys.add(plan["version"] + ':expired')
+    state["plan_notification_keys"] = sorted(keys)
+    state["plan_statuses"] = statuses
+    save_state(state)
+    # Old full reports are not replayed into a plan-only notification channel.
+    check_new_videos(state, now, plan=plan)
+    state["last_plan_check"] = now.date().isoformat()
+    state["last_success"] = now.isoformat()
+    state["error_alerted"] = False
+    state["consecutive_failures"] = 0
+    save_state(state)
+    print("OK: plan-only daily check; quotes=%d; proposals processed" % len(quotes))
+
+
 def main():
     state = load_state()
+    plan = load_plan()
+    if plan is not None:
+        run_plan(state, plan, datetime.now(MSK))
+        return
     video_reports_sent = send_video_reports(state)
     new_videos = check_new_videos(state, datetime.now(MSK))
     quotes = fetch_quotes()
@@ -260,6 +356,13 @@ def record_failure():
     state = load_state()
     state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
     save_state(state)
+    # Technical diagnostics remain in Railway logs. They are not portfolio changes.
+    try:
+        if load_plan() is not None:
+            return
+    except Exception:
+        print("FAIL: plan configuration invalid; trading notifications disabled", file=sys.stderr)
+        return
     if state["consecutive_failures"] >= 3 and not state.get("error_alerted") and TOKEN and CHAT_ID:
         send("⚠️ Капитал: проверка рынка временно недоступна\n\n"
              "Три запуска подряд завершились ошибкой. Последние данные могут быть устаревшими.\n\n"
@@ -279,4 +382,4 @@ if __name__ == "__main__":
             record_failure()
         except Exception as alert_error:
             print("FAIL alert: %s" % type(alert_error).__name__, file=sys.stderr)
-        sys.exit(0)
+        sys.exit(1)

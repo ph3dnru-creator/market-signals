@@ -58,3 +58,29 @@ class VideoReportDeliveryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PlanOnlyVideoTest(unittest.TestCase):
+    def test_no_change_is_archived_without_telegram(self):
+        from signals import load_plan
+        with tempfile.TemporaryDirectory() as directory:
+            baseline=Path(directory)/'baseline.json'
+            baseline.write_text(json.dumps({k:[] for k in digest.CHANNELS}))
+            now=datetime(2026,11,28,10,tzinfo=ZoneInfo('Europe/Moscow'))
+            video={'id':'Co8EMfLkVoc','channel':'Тест'}
+            with patch.object(digest,'STATE',Path(directory)/'state.json'),patch.object(digest,'VIDEO_BASELINE',baseline),patch.object(digest,'recent_videos',return_value=[video]),patch.object(digest,'analyze_video',return_value='full report'),patch.object(digest,'plan_proposal',return_value=None),patch.object(digest,'send') as send:
+                state=digest.load_state()
+                self.assertEqual(digest.check_new_videos(state,now,load_plan()),0)
+                self.assertEqual(digest.check_new_videos(state,now.replace(day=29),load_plan()),0)
+                send.assert_not_called()
+                self.assertIn(video['id'],state['video_reviewed_ids'])
+                self.assertEqual(state['video_pending'],{})
+
+    def test_same_proposal_from_different_videos_is_sent_once(self):
+        from signals import load_plan
+        with tempfile.TemporaryDirectory() as directory:
+            baseline=Path(directory)/'baseline.json';baseline.write_text(json.dumps({k:[] for k in digest.CHANNELS}))
+            now=datetime(2026,11,28,10,tzinfo=ZoneInfo('Europe/Moscow'))
+            videos=[{'id':'Co8EMfLkVoc','channel':'Тест'},{'id':'DgrMwgrgBLQ','channel':'Тест'}]
+            with patch.object(digest,'STATE',Path(directory)/'state.json'),patch.object(digest,'VIDEO_BASELINE',baseline),patch.object(digest,'recent_videos',return_value=videos),patch.object(digest,'analyze_video',return_value='report'),patch.object(digest,'plan_proposal',return_value=('same-action','Было → предлагаю')),patch.object(digest,'send') as send:
+                state=digest.load_state();digest.check_new_videos(state,now,load_plan())
+                send.assert_called_once_with('Было → предлагаю')

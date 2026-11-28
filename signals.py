@@ -6,9 +6,118 @@
 """
 
 import json
+import math
+from datetime import date, datetime
 from pathlib import Path
 
 ACTION_PLAN = Path(__file__).with_name("signal_actions.json")
+STRATEGY = Path(__file__).with_name("video_strategy.json")
+
+
+def load_plan():
+    plan = json.loads(STRATEGY.read_text(encoding="utf-8"))["plan"]
+    rows = plan["rows"]
+    if not plan.get("version") or not isinstance(plan["broker_ready"], bool):
+        raise ValueError("Invalid plan version or broker gate")
+    ids = [r["id"] for r in rows]
+    if len(ids) != len(set(ids)):
+        raise ValueError("Duplicate plan rows")
+    for row in rows:
+        budget, tranche = row["budget_rub"], row["first_tranche_rub"]
+        if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) for v in (budget, tranche)) or not 0 <= tranche <= budget:
+            raise ValueError("Invalid plan budget")
+        if row.get("symbol") and not 0 < row["min_price"] <= row["max_price"]:
+            raise ValueError("Invalid entry range")
+    risk_budget = sum(r["budget_rub"] for r in rows if r.get("symbol"))
+    if not 0 <= risk_budget <= plan["theme_cap_rub"] <= plan["free_capital_rub"]:
+        raise ValueError("Plan exceeds available budget")
+    date.fromisoformat(plan["review_by"])
+    return plan
+
+
+def plan_snapshot(plan):
+    # Dates, market quotes and source prose alone do not change an action.
+    fields = ("id", "asset", "side", "budget_rub", "first_tranche_rub", "price", "when", "wait_for", "status")
+    return {"rows": [{k: r[k] for k in fields} for r in plan["rows"]],
+            "broker_ready": plan["broker_ready"], "review_by": plan["review_by"],
+            "free_capital_rub": plan["free_capital_rub"], "obligations": plan["obligations"]}
+
+
+def rub(value):
+    return format(value, ",.0f").replace(",", " ") + " ₽"
+
+
+def format_plan_change(plan, previous):
+    current = plan_snapshot(plan)
+    if previous == current:
+        return None
+    if previous is None:
+        return ("📋 Капитал · обновлён план\n\n"
+                "Сейчас: новых рискованных покупок 0 ₽.\n"
+                f"Сохраняем ликвидно: {rub(plan['free_capital_rub'])}.\n\n"
+                "Neo: первый транш 100 000 ₽ только при C$18–19.\n"
+                "MP: первый транш 50 000 ₽ только при $22–25.\n"
+                "До подтверждения брокера заявки не ставим. Общий лимит темы 450 000 ₽ включён в 3 млн ₽.\n\n"
+                "Старые покупки валюты на 22 млн ₽ и крипты на 10,7 млн ₽ сняты с исполнения.\n"
+                "Новые видео без конкретного изменения плана — без уведомлений.\n\n" + plan["dashboard_url"])
+    old = {r["id"]: r for r in previous.get("rows", [])}
+    changed = [r for r in current["rows"] if old.get(r["id"]) != r]
+    lines = ["📋 Капитал · изменился план", ""]
+    for row in changed:
+        before = old.get(row["id"])
+        lines += [row["asset"], "Было: " + (f"{before['side']}; первый транш {rub(before['first_tranche_rub'])}; {before['price']}" if before else "строки не было"),
+                  f"Теперь: {row['side']}; первый транш {rub(row['first_tranche_rub'])}; {row['price']}",
+                  "Ждём: " + row["wait_for"], ""]
+    if previous.get("broker_ready") != current["broker_ready"]:
+        lines += ["Брокер: " + ("маршрут подтверждён; дополнительно требуется цена входа." if plan["broker_ready"] else "покупки заблокированы до подтверждения маршрута."), ""]
+    if previous.get("free_capital_rub") != current["free_capital_rub"]:
+        lines += ["Свободный бюджет: " + rub(plan["free_capital_rub"]), ""]
+    if previous.get("review_by") != current["review_by"]:
+        lines += ["Срок пересмотра: " + plan["review_by"], ""]
+    if previous.get("obligations") != current["obligations"]:
+        lines += ["Обновлён график обязательных платежей — проверь резерв в плане.", ""]
+    # Whole rows may exceed Telegram's limit; the dashboard holds the full diff.
+    message = "\n".join(lines)
+    return message[:3400] + "\n\n" + plan["dashboard_url"]
+
+
+def evaluate_plan(plan, quotes, previous, now):
+    statuses, events = {}, []
+    for row in plan["rows"]:
+        if not row.get("symbol"):
+            continue
+        quote = quotes.get(row["id"])
+        if now.date() > date.fromisoformat(plan["review_by"]):
+            status = "expired"
+        elif not plan["broker_ready"]:
+            status = "blocked"
+        elif quote is None:
+            status = "unknown"
+        else:
+            price = quote["price"]
+            age = now.timestamp() - quote["timestamp"]
+            if not isinstance(price, (int, float)) or not math.isfinite(price) or price <= 0 or not -300 <= age <= 3 * 86400 or quote["currency"] != row["currency"]:
+                status = "unknown"
+            else:
+                status = "ready" if row["min_price"] <= price <= row["max_price"] else "wait"
+        # Missing/stale quotes never manufacture an exit from an entry condition.
+        if status == "unknown":
+            statuses[row["id"]] = previous.get(row["id"], "unknown")
+            continue
+        statuses[row["id"]] = status
+        if status == "ready" and previous.get(row["id"]) != "ready":
+            events.append({"id": row["id"], "row": row, "quote": quote})
+    return statuses, events
+
+
+def format_plan_entry(event):
+    row, quote = event["row"], event["quote"]
+    return (f"🔔 Капитал · выполнено ценовое условие\n\n{row['asset']}\n"
+            f"Действие: проверить свежие новости и подготовить покупку на {rub(row['first_tranche_rub'])}.\n"
+            f"Лимит цены: {row['price']}.\n"
+            f"Цена источника: {quote['price']:.2f} {quote['currency']}.\n\n"
+            f"Почему: {row['reason']}\n"
+            "Остальные транши не покупать. Сделка автоматически не совершается; брокерская цена и комиссии проверяются перед заявкой.")
 
 RULES = (
     ("btc_down", "BTC ниже $57 735", "btc", lambda q: q["btc"] < 57735,

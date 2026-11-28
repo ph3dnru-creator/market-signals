@@ -12,6 +12,9 @@ BASE = {"btc": 86000, "eth": 2700, "usd": 83, "usd_date": "27/09/2026",
 
 class DigestTest(unittest.TestCase):
     def setUp(self):
+        legacy = patch.object(digest, 'load_plan', return_value=None)
+        legacy.start()
+        self.addCleanup(legacy.stop)
         formatter = patch.object(digest, 'format_event', return_value='Approved action')
         formatter.start()
         self.addCleanup(formatter.stop)
@@ -84,3 +87,39 @@ class DigestTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PlanDigestTest(unittest.TestCase):
+    def setUp(self):
+        from signals import load_plan
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        self.plan=load_plan()
+        self.now=datetime(2026,11,28,10,tzinfo=ZoneInfo('Europe/Moscow'))
+
+    def test_daily_check_and_plan_diff_are_not_replayed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(digest,'STATE',Path(directory)/'state.json'), patch.object(digest,'send') as send, patch.object(digest,'fetch_plan_quotes',return_value={}), patch.object(digest,'check_new_videos') as videos:
+                state=digest.load_state()
+                digest.run_plan(state,self.plan,self.now)
+                digest.run_plan(state,self.plan,self.now)
+                self.assertEqual(send.call_count,1)
+                self.assertEqual(videos.call_count,1)
+                self.assertIn('обновлён план',send.call_args.args[0])
+
+    def test_failed_plan_delivery_is_retried_without_losing_diff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(digest,'STATE',Path(directory)/'state.json'),patch.object(digest,'send',side_effect=RuntimeError('network')):
+                state=digest.load_state()
+                with self.assertRaises(RuntimeError):digest.run_plan(state,self.plan,self.now)
+                self.assertNotIn('plan_snapshot',state)
+                self.assertNotIn('last_plan_check',state)
+
+    def test_deadline_once_and_no_legacy_report_dispatch(self):
+        from signals import plan_snapshot
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(digest,'STATE',Path(directory)/'state.json'),patch.object(digest,'send') as send,patch.object(digest,'fetch_plan_quotes',return_value={}),patch.object(digest,'check_new_videos'),patch.object(digest,'send_video_reports',side_effect=AssertionError('must not replay')):
+                state={'version':2,'plan_snapshot':plan_snapshot(self.plan)}
+                digest.run_plan(state,self.plan,self.now.replace(month=12,day=4))
+                digest.run_plan(state,self.plan,self.now.replace(month=12,day=5))
+                self.assertEqual(send.call_count,1)
+                self.assertIn('2 782 322 ₽',send.call_args.args[0])
